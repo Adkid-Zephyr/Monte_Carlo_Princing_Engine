@@ -1,0 +1,122 @@
+# snowball_extend.py
+# 交易日步长 1/248，希腊值按标的 1% 扰动计算
+# --------------------------------------------------
+import numpy as np
+import math
+import time
+
+# ---------- 1. 产品参数 ----------
+S0         = 25.66           # 期初标的价格
+vol        = 0.30            # 年化波动率
+r          = 0.06            # 无风险利率
+q          = 0.00            # 股息率
+T_days     = 248             # 一年交易日总数
+trade_days = np.array([66, 94, 104, 126, 147, 168, 184, 204, 227, 248])  # 敲出观察日（交易日计数）
+kout_bar   = np.array([1.000, 0.995, 0.990, 0.985, 0.980,
+                       0.975, 0.970, 0.965, 0.960, 0.955]) * S0  # 敲出价格逐月递减
+kin_bar    = 0.75 * S0       # 敲入障碍（固定）
+coupon_out = 0.14          # 敲出票息（年化）
+coupon_reb = 0.14            # 未敲入敲出 rebate 票息
+p_call     = 0.0             # 无额外 call 期权
+k_call     = S0              # call 行权价（占位）
+p_put      = 1.0             # 参与率 100%
+k_put      = S0              # 看跌行权价
+bottom     = 0.80 * S0       # 最低赔付价
+cpn_back   = 0.02            # 后端票息
+prem_back  = 0.01 * S0       # 返还前端费用
+margin_rt  = 0.25            # 保证金比例
+margin_r   = 0.03            # 保证金资金成本
+N_PATHS    = 20_000          # MC 路径数
+SEED       = 42              # 复现随机种子
+dt         = 1 / 248         # 单步时长（1 个交易日）
+n_steps    = 248             # 总步数 = 交易日天数
+
+# ---------- 2. 单条路径估值 ----------
+def pv_one_path(S):
+    """
+    S: 长度为 n_steps+1 的 ndarray，标的价格路径
+    返回该路径贴现后的产品价值
+    """
+    # 2-1 先检查敲入、敲出事件
+    knock_in  = np.any(S <= kin_bar)        # 是否曾低于敲入
+    knock_out = False
+    tau       = n_steps                     # 默认到期日
+    for idx, obs in enumerate(trade_days):  # 按观察日顺序检查敲出
+        if S[obs] >= kout_bar[idx]:
+            knock_out = True
+            tau = obs                       # 敲出时刻（交易日计数）
+            break
+
+    # 2-2 贴现因子：仍用 365 天年化，如需交易日基准可把 365 改成 248
+    df = math.exp(-r * tau / 365)
+
+    # 2-3 情景 1：敲出
+    if knock_out:
+        coup         = S0 * coupon_out * tau / 365
+        call_pay     = p_call * max(S[tau] - k_call, 0)
+        cpn_b        = S0 * cpn_back * tau / 365
+        margin_cost  = margin_rt * S0 * margin_r * tau / 365
+        return df * (coup + call_pay + cpn_b + prem_back - margin_cost)
+
+    # 2-4 情景 2：未敲入且未敲出
+    if not knock_in:
+        rebate      = S0 * coupon_reb * n_steps / 365
+        cpn_b       = S0 * cpn_back * n_steps / 365
+        margin_cost = margin_rt * S0 * margin_r * n_steps / 365
+        return df * (rebate + cpn_b + prem_back - margin_cost)
+
+    # 2-5 情景 3：敲入且未敲出（看跌赔付）
+    put_pay     = -p_put * min(max(k_put - S[-1], 0), k_put - bottom)
+    cpn_b       = S0 * cpn_back * n_steps / 365
+    margin_cost = margin_rt * S0 * margin_r * n_steps / 365
+    return math.exp(-r * n_steps / 365) * (put_pay + cpn_b + prem_back - margin_cost)
+
+# ---------- 3. 估值 + 希腊值 ----------
+def price_and_greeks():
+    """
+    使用中心差分法计算 Delta、Gamma
+    扰动幅度 dS = 1% S0
+    """
+    dS = 0.01 * S0  # 1% 相对扰动
+
+    # 3-1 生成随机数（复用）
+    np.random.seed(SEED)
+    Z = np.random.standard_normal((N_PATHS, n_steps))
+
+    # 3-2 一次性生成三条路径：
+    #     paths[0,:,:] -> S0 - dS
+    #     paths[1,:,:] -> S0
+    #     paths[2,:,:] -> S0 + dS
+    starts   = np.array([S0 - dS, S0, S0 + dS])[:, None]  # shape (3,1)
+    log_paths = np.zeros((3, N_PATHS, n_steps + 1))
+    log_paths[:, :, 0] = np.log(starts)
+
+    drift_vec  = (r - q - 0.5 * vol ** 2) * dt
+    sigma_vec  = vol * np.sqrt(dt)
+
+    # 3-3 逐时间步更新对数价格，再取指数
+    for t in range(1, n_steps + 1):
+        log_paths[:, :, t] = (
+            log_paths[:, :, t-1] + drift_vec + sigma_vec * Z[:, t-1]
+        )
+    paths = np.exp(log_paths)  # shape (3, N_PATHS, n_steps+1)
+
+    # 3-4 计算三条扰动的 PV 均值
+    pv = np.array([pv_one_path(paths[i, j])
+                   for i in range(3) for j in range(N_PATHS)])
+    pv = pv.reshape(3, N_PATHS).mean(axis=1)  # 长度 3 的数组
+
+    # 3-5 计算希腊值
+    pv_pct = pv[1] / S0 * 100      # 中间价格（百分比报价）
+    delta  = (pv[2] - pv[0]) / (2 * dS)
+    gamma  = (pv[2] - 2 * pv[1] + pv[0]) / (dS ** 2)
+    return pv_pct, delta, gamma
+
+# ---------- 4. 主程序 ----------
+if __name__ == "__main__":
+    t0 = time.time()
+    pv, delta, gamma = price_and_greeks()
+    print(f"PV(% notional) = {pv:.3f} %")
+    print(f"Delta          = {delta:.4f}")
+    print(f"Gamma          = {gamma:.6f}")
+    print(f"Time used      = {time.time()-t0:.2f} s")
